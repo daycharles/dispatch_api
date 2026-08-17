@@ -2,13 +2,16 @@ name: ci-cd
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
-    branches: [main]
+    branches: [master]
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  ACR_NAME: acrdispatchapi
+  REGISTRY: acrdispatchapi.azurecr.io
+  IMAGE_NAME: dispatch-api
+  RESOURCE_GROUP: rg-dispatch-api
+  CONTAINER_APP: ca-dispatch-api
 
 jobs:
   build-and-test:
@@ -41,27 +44,30 @@ jobs:
   publish-image:
     name: Build and push container image
     needs: build-and-test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      id-token: write
     outputs:
       image: ${{ steps.meta.outputs.tags }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+      - name: Azure login (OIDC, no stored password)
+        uses: azure/login@v2
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to Azure Container Registry
+        run: az acr login -n "$ACR_NAME"
 
       - name: Derive image tags
         id: meta
         run: |
-          IMAGE="${REGISTRY}/${IMAGE_NAME,,}"
+          IMAGE="${REGISTRY}/${IMAGE_NAME}"
           echo "tags=${IMAGE}:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           echo "latest=${IMAGE}:latest" >> "$GITHUB_OUTPUT"
 
@@ -79,7 +85,7 @@ jobs:
   deploy:
     name: Deploy to Azure Container Apps
     needs: publish-image
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -100,14 +106,37 @@ jobs:
           inlineScript: |
             az config set extension.use_dynamic_install=yes_without_prompt
             az containerapp update \
-              --name dispatch-api \
-              --resource-group dispatch-api-rg \
+              --name ${{ env.CONTAINER_APP }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
               --image "${{ needs.publish-image.outputs.image }}"
+
+      # Ingress is IP-restricted to the operator's workstation, so the runner cannot
+      # reach /health until its own egress IP is allow-listed. The rule is added for the
+      # length of the smoke test and removed in the always() step below.
+      - name: Allow this runner through ingress
+        id: allow
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az config set extension.use_dynamic_install=yes_without_prompt
+            RUNNER_IP=$(curl -s https://api.ipify.org)
+            echo "runner ip: ${RUNNER_IP}"
+            az containerapp ingress access-restriction set \
+              --name ${{ env.CONTAINER_APP }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --rule-name gh-runner \
+              --ip-address "${RUNNER_IP}/32" \
+              --action Allow -o none
+            FQDN=$(az containerapp show --name ${{ env.CONTAINER_APP }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --query properties.configuration.ingress.fqdn -o tsv)
+            echo "fqdn=${FQDN}" >> "$GITHUB_OUTPUT"
 
       - name: Smoke test the deployment
         run: |
           set -euo pipefail
-          URL="${{ vars.APP_URL }}/health"
+          URL="https://${{ steps.allow.outputs.fqdn }}/health"
           for attempt in $(seq 1 12); do
             code=$(curl -s -o /dev/null -w '%{http_code}' "$URL" || echo 000)
             if [ "$code" = "200" ]; then
@@ -119,3 +148,15 @@ jobs:
           done
           echo "Deployment did not become healthy." >&2
           exit 1
+
+      - name: Revoke the runner ingress rule
+        if: always()
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az config set extension.use_dynamic_install=yes_without_prompt
+            az containerapp ingress access-restriction remove \
+              --name ${{ env.CONTAINER_APP }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --rule-name gh-runner -o none
