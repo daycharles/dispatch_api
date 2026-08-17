@@ -1,0 +1,121 @@
+name: ci-cd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --no-restore -c Release
+
+      - name: Test
+        run: dotnet test --no-build -c Release --logger "trx;LogFileName=results.trx"
+
+      - name: Publish test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: '**/results.trx'
+
+  publish-image:
+    name: Build and push container image
+    needs: build-and-test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        run: |
+          IMAGE="${REGISTRY}/${IMAGE_NAME,,}"
+          echo "tags=${IMAGE}:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "latest=${IMAGE}:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.tags }}
+            ${{ steps.meta.outputs.latest }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to Azure Container Apps
+    needs: publish-image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    environment: production
+    steps:
+      - name: Azure login (OIDC, no stored password)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Update the container app to the new image
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az config set extension.use_dynamic_install=yes_without_prompt
+            az containerapp update \
+              --name dispatch-api \
+              --resource-group dispatch-api-rg \
+              --image "${{ needs.publish-image.outputs.image }}"
+
+      - name: Smoke test the deployment
+        run: |
+          set -euo pipefail
+          URL="${{ vars.APP_URL }}/health"
+          for attempt in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$URL" || echo 000)
+            if [ "$code" = "200" ]; then
+              echo "Healthy after ${attempt} attempt(s)."
+              exit 0
+            fi
+            echo "Attempt ${attempt}: got ${code}, retrying..."
+            sleep 10
+          done
+          echo "Deployment did not become healthy." >&2
+          exit 1
