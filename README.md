@@ -6,7 +6,8 @@ Built to be small enough to read in one sitting and complete enough to run in th
 cloud.
 
 **Stack:** C# / .NET 8 · ASP.NET Core Minimal APIs · Entity Framework Core ·
-Microsoft SQL Server · xUnit · Docker · GitHub Actions · Azure Container Apps
+Microsoft SQL Server · RabbitMQ · xUnit · Docker · GitHub Actions ·
+Azure Container Apps
 
 ---
 
@@ -24,6 +25,16 @@ show in a CRUD sample:
   there is a test pinning the behaviour.
 - **Ordering that belongs on the server.** The dispatcher queue sorts by priority,
   then by age, so every client sees the same order.
+- **Asynchronous work that must not lose or double-apply a message.** Incident
+  transitions are published to RabbitMQ and turned into notifications by a
+  background consumer. The dead-letter exchange is fanout rather than topic,
+  because a dead-lettered message keeps its original routing key and a topic DLX
+  would silently drop anything it had no binding for. The queue is quorum rather
+  than classic, because notifications have to survive the loss of the node
+  holding them. The consumer's identity is a compile-time constant rather than
+  configuration, because it is half of an idempotency key already in the
+  database — a typo in `appsettings.json` would replay every message the service
+  has ever handled.
 
 ## Running it locally
 
@@ -33,8 +44,13 @@ docker compose up --build
 
 Then open <http://localhost:8080/swagger>.
 
-The compose file starts SQL Server 2022 and waits for it to pass a health check
-before starting the API. First start takes a minute or two while SQL initialises.
+The compose file starts SQL Server 2022 and RabbitMQ 3.12, and the API waits for
+*both* to pass their health checks before it starts. First start takes a minute or
+two while SQL initialises.
+
+The broker's management UI is at <http://localhost:15672> (guest/guest), which is
+where the exchange, the queue's quorum type and its dead-letter arguments can
+actually be seen.
 
 ### Without Docker
 
@@ -44,8 +60,11 @@ dotnet test
 dotnet run --project src/DispatchApi
 ```
 
-You will need a reachable SQL Server; set the connection string via
-`ConnectionStrings__Dispatch`.
+You will need a reachable SQL Server, set via `ConnectionStrings__Dispatch`, and a
+reachable broker — see [Configuration](#configuration) for the `Messaging__*`
+variables. If you have no broker, `Messaging__Enabled=false` is the supported
+escape hatch: it swaps in `NullIncidentPublisher`, starts no consumer, and
+registers no broker health check, so the HTTP API works and nothing is published.
 
 ## Tests
 
@@ -53,8 +72,13 @@ You will need a reachable SQL Server; set the connection string via
 dotnet test
 ```
 
-Thirteen unit tests cover the assignment rules, the response-time metric, and the
-queue ordering. Time is injected through `IClock` so timing behaviour is tested
+Twenty-six unit tests. Thirteen (`DispatchServiceTests.cs`) cover the assignment
+rules, the response-time metric, and the queue ordering; thirteen
+(`MessagingTests.cs`) cover which transitions publish which events, the topology
+arguments, idempotent handling of a redelivered message, and poison versus
+transient failure routing. No test touches a live broker — see
+[Verifying the topology](#verifying-the-topology) for the half that needs one.
+Time is injected through `IClock` so timing behaviour is tested
 deterministically rather than by sleeping, and each test gets its own in-memory
 store so they can run in parallel without leaking state.
 
@@ -62,7 +86,8 @@ store so they can run in parallel without leaking state.
 
 | Method | Route | Purpose |
 |---|---|---|
-| `GET` | `/health` | Liveness probe |
+| `GET` | `/health` | Liveness only — deliberately asserts nothing |
+| `GET` | `/health/ready` | Readiness; includes the broker when messaging is enabled |
 | `GET` | `/api/units` | List units |
 | `POST` | `/api/units` | Register a unit |
 | `GET` | `/api/incidents` | Dispatcher queue, most urgent first |
@@ -71,22 +96,104 @@ store so they can run in parallel without leaking state.
 | `POST` | `/api/incidents/{id}/assign` | Assign a unit |
 | `POST` | `/api/incidents/{id}/clear` | Clear a unit |
 | `POST` | `/api/incidents/{id}/close` | Close and free all units |
+| `GET` | `/api/incidents/{id}/notifications` | Notifications raised asynchronously by the consumer |
 
 Expected refusals — assigning a committed unit, assigning to a closed call —
 return `400` with a message rather than throwing. Only genuinely unexpected
 conditions become exceptions.
+
+## Messaging
+
+Incident transitions are published to RabbitMQ; a background consumer turns the
+ones that matter into notifications, readable at
+`GET /api/incidents/{id}/notifications`. `Messaging:Enabled` gates all of it.
+
+### Topology
+
+Every name and argument below is a constant in
+`src/DispatchApi/Messaging/DispatchTopology.cs`, declared at startup by
+`TopologyInitializer`, so a fresh broker needs no manual setup.
+
+| Object | Name | Arguments |
+|---|---|---|
+| Exchange | `dispatch.events` | `topic`, durable |
+| Dead-letter exchange | `dispatch.events.dlx` | `fanout`, durable |
+| Queue | `dispatch.notifications` | `x-queue-type: quorum`, `x-dead-letter-exchange: dispatch.events.dlx`, `x-delivery-limit: 5` |
+| Dead-letter queue | `dispatch.notifications.dlq` | `x-queue-type: quorum`; no DLX of its own |
+| Binding | `incident.*` | `dispatch.events` → `dispatch.notifications` |
+
+Routing keys: `incident.created`, `incident.assigned`, `incident.cleared`,
+`incident.closed`.
+
+Why those choices:
+
+- **The DLX is fanout, not topic.** A dead-lettered message keeps its original
+  routing key, so a topic DLX would need a binding per key and would silently drop
+  anything it had no binding for — the one thing a DLX must not do.
+- **The DLQ has no dead-letter exchange of its own.** A DLQ that dead-letters is a
+  loop.
+- **Quorum, not classic.** Notifications have to survive the loss of the node
+  holding them.
+- **`x-delivery-limit: 5`** is enough requeues to ride out a database restart, few
+  enough that a genuinely stuck message does not hold up the queue.
+- **One `incident.*` binding**, so a new `incident.*` type reaches the consumer
+  without a broker change; the consumer ignores the events it has no opinion about.
+
+A poison message — unknown routing key, malformed body — is nacked with
+`requeue: false` and dead-letters immediately rather than burning five deliveries.
+A transient failure is nacked with `requeue: true` and rides the delivery limit.
+
+### Configuration
+
+Section `Messaging` of `appsettings.json`; each key is also settable as an
+environment variable in the double-underscore form.
+
+| Key | Environment variable | Default |
+|---|---|---|
+| `Enabled` | `Messaging__Enabled` | `true` |
+| `Host` | `Messaging__Host` | `localhost` |
+| `Port` | `Messaging__Port` | `5672` |
+| `UserName` | `Messaging__UserName` | `guest` |
+| `Password` | `Messaging__Password` | `guest` |
+| `VirtualHost` | `Messaging__VirtualHost` | `/` |
+| `ClientName` | `Messaging__ClientName` | `dispatch-api` |
+| `PrefetchCount` | `Messaging__PrefetchCount` | `16` |
+
+Compose overrides exactly one of them, `Messaging__Host: rabbitmq`; everything else
+comes from `appsettings.json`.
+
+### Verifying the topology
+
+The xUnit suite deliberately never touches a broker. `tools/verify_topology.py`
+covers the half it cannot: that RabbitMQ actually accepts these queue arguments,
+that the topic binding routes what it should and refuses what it should not, and
+that both routes into the dead-letter queue behave as the code comments claim.
+
+```bash
+pip install pika
+docker compose up -d rabbitmq
+python3 tools/verify_topology.py
+```
+
+It creates and destroys its own queues and exits non-zero on failure — safe
+against a local broker, pointless against a shared one. Start the broker on its
+own, as above: with the API running, its consumer competes for the messages the
+script publishes and the routing checks fail on an empty queue.
 
 ## Pipeline
 
 `.github/workflows/ci-cd.yml` runs on every push and pull request:
 
 1. **build-and-test** — restore, build in Release, run tests, upload the `.trx`.
-2. **publish-image** — on `main` only: build the image and push it to GitHub
-   Container Registry, tagged with the short SHA and `latest`. Layer cache is
-   kept in GitHub Actions cache.
-3. **deploy** — on `main` only: authenticate to Azure by OIDC federated
+2. **publish-image** — on `master` only: build the image and push it to Azure
+   Container Registry (`acrdispatchapi.azurecr.io`), tagged with the short SHA and
+   `latest`. Layer cache is kept in the GitHub Actions cache; the `Set up Buildx`
+   step exists solely because the default docker driver cannot export a
+   `type=gha` cache.
+3. **deploy** — on `master` only: authenticate to Azure by OIDC federated
    credential (no stored secret), roll the Container App to the new image, then
-   poll `/health` until it returns 200 or fail the run.
+   poll `/health` until it returns 200 or fail the run. That smoke test hits
+   liveness, which by design would pass with SQL and the broker both down.
 
 The Dockerfile is multi-stage: the SDK image restores, tests and publishes; the
 runtime image carries only the published output and runs as the base image's
@@ -105,6 +212,12 @@ Stated deliberately rather than left for a reader to find:
   `Unit` plus retry — worth doing, not done.
 - **`GET /api/incidents` is unpaged.** Fine at demo volume, wrong at agency volume.
 - **Single region, single replica.** No scale rules configured.
+- **The deployed Container App has no broker.** `Messaging:Enabled` defaults to
+  `true` and `Messaging:Host` to `localhost`, and nothing provisions RabbitMQ in
+  Azure — so a deploy today publishes into a connection that cannot open and
+  `/health/ready` reports Unhealthy. `/health` (liveness) still passes, which is
+  why the pipeline's smoke test goes green. Until a broker is provisioned, set
+  `Messaging__Enabled=false` on the Container App.
 
 ## One-time Azure setup
 
@@ -178,7 +291,8 @@ az containerapp show -n $APP -g $RG --query properties.configuration.ingress.fqd
 `AcrPull` on its own system-assigned identity and pulls with no credential stored anywhere.
 `ASPNETCORE_ENVIRONMENT=Development` is still required — it is what gates `EnsureCreated()`,
 and no migrations exist yet. `Connection Timeout=60` covers a serverless resume, which can
-take 30–60s; the app has no `EnableRetryOnFailure`.
+take 30–60s, and `Program.cs:16` adds `EnableRetryOnFailure()` so transient
+faults after that are retried rather than surfaced.
 
 Known CLI wart: `az containerapp create --registry-identity system` can return a bare
 `(InternalServerError)` and still create the app — with the `k8se/quickstart` placeholder image
