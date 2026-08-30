@@ -13,13 +13,34 @@ services:
       retries: 12
       start_period: 20s
 
+  rabbitmq:
+    # The -management tag is what exposes 15672, where the exchange, the queue's
+    # quorum type and its dead-letter arguments can actually be seen.
+    image: rabbitmq:3.12-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      # ping, not a port check: the broker accepts TCP well before it will accept
+      # a channel, so a port check would let the API start too early.
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
   api:
     build: .
     depends_on:
       sql:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       ConnectionStrings__Dispatch: "Server=sql,1433;Database=Dispatch;User Id=sa;Password=Your_password123;TrustServerCertificate=True;Encrypt=False"
+      # Everything else comes from appsettings.json; only the host differs
+      # between Compose and a developer running the API outside it.
+      Messaging__Host: rabbitmq
     ports:
       - "8080:8080"

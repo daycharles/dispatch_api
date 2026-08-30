@@ -10,6 +10,8 @@ public class DispatchContext : DbContext
     public DbSet<Incident> Incidents => Set<Incident>();
     public DbSet<Unit> Units => Set<Unit>();
     public DbSet<Assignment> Assignments => Set<Assignment>();
+    public DbSet<IncidentNotification> IncidentNotifications => Set<IncidentNotification>();
+    public DbSet<ProcessedMessage> ProcessedMessages => Set<ProcessedMessage>();
 
     protected override void OnModelCreating(ModelBuilder b)
     {
@@ -40,5 +42,15 @@ public class DispatchContext : DbContext
         // One active assignment per unit per incident.
         b.Entity<Assignment>()
             .HasIndex(a => new { a.UnitId, a.IncidentId, a.ClearedAtUtc });
+
+        // The composite key IS the idempotency guarantee for message consumers.
+        // The read-before-insert in EfProcessedMessageStore only keeps the
+        // duplicate-key exception rare; this is what makes it impossible for
+        // two instances to both process the same delivery.
+        b.Entity<ProcessedMessage>()
+            .HasKey(m => new { m.Consumer, m.MessageId });
+
+        b.Entity<IncidentNotification>()
+            .HasIndex(n => n.IncidentId);
     }
 }

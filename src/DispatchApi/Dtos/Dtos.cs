@@ -35,6 +35,22 @@ public record IncidentResponse(
             .ToList());
 }
 
+/// <summary>
+/// Raised by the message consumer, not by the request that caused it. Reading
+/// these back is the end-to-end proof that a message was published, routed and
+/// consumed.
+/// </summary>
+public record NotificationResponse(
+    int Id,
+    int IncidentId,
+    string Trigger,
+    string Message,
+    DateTimeOffset RaisedAtUtc)
+{
+    public static NotificationResponse From(IncidentNotification n) =>
+        new(n.Id, n.IncidentId, n.Trigger, n.Message, n.RaisedAtUtc);
+}
+
 public record CreateUnitRequest(string CallSign);
 
 public record UnitResponse(int Id, string CallSign, UnitStatus Status)

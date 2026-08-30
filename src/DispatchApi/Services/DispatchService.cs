@@ -1,5 +1,6 @@
 using DispatchApi.Data;
 using DispatchApi.Dtos;
+using DispatchApi.Messaging;
 using DispatchApi.Models;
 using Microsoft.EntityFrameworkCore;
 
@@ -19,11 +20,13 @@ public class DispatchService : IDispatchService
 {
     private readonly DispatchContext _db;
     private readonly IClock _clock;
+    private readonly IIncidentPublisher _publisher;
 
-    public DispatchService(DispatchContext db, IClock clock)
+    public DispatchService(DispatchContext db, IClock clock, IIncidentPublisher publisher)
     {
         _db = db;
         _clock = clock;
+        _publisher = publisher;
     }
 
     public async Task<Incident> CreateIncidentAsync(CreateIncidentRequest request, CancellationToken ct = default)
@@ -41,6 +44,17 @@ public class DispatchService : IDispatchService
 
         _db.Incidents.Add(incident);
         await _db.SaveChangesAsync(ct);
+
+        // Published after the commit, never before: an event announcing an
+        // incident that then failed to save is worse than a missing event,
+        // because consumers cannot un-see it.
+        await _publisher.PublishAsync(new IncidentCreated(
+            incident.Id,
+            incident.CallType,
+            incident.Address,
+            incident.Priority,
+            incident.ReceivedAtUtc), ct);
+
         return incident;
     }
 
@@ -94,6 +108,7 @@ public class DispatchService : IDispatchService
             return DispatchResult.Fail($"Unit {unit.CallSign} is committed to another incident.");
 
         var now = _clock.UtcNow;
+        var isFirstUnit = incident.FirstAssignedAtUtc is null;
 
         // Added through the navigation property, not _db.Assignments, so the
         // in-memory graph is correct immediately and the duplicate-assignment
@@ -114,6 +129,10 @@ public class DispatchService : IDispatchService
         incident.FirstAssignedAtUtc ??= now;
 
         await _db.SaveChangesAsync(ct);
+
+        await _publisher.PublishAsync(new UnitAssigned(
+            incidentId, unitId, unit.CallSign, now, isFirstUnit), ct);
+
         return DispatchResult.Ok();
     }
 
@@ -128,7 +147,8 @@ public class DispatchService : IDispatchService
         if (assignment is null)
             return DispatchResult.Fail("No active assignment found for that unit on that incident.");
 
-        assignment.ClearedAtUtc = _clock.UtcNow;
+        var clearedAt = _clock.UtcNow;
+        assignment.ClearedAtUtc = clearedAt;
 
         if (assignment.Unit is not null)
             assignment.Unit.Status = UnitStatus.Available;
@@ -144,6 +164,10 @@ public class DispatchService : IDispatchService
             incident.Status = IncidentStatus.Open;
 
         await _db.SaveChangesAsync(ct);
+
+        await _publisher.PublishAsync(new UnitCleared(
+            incidentId, unitId, assignment.Unit?.CallSign ?? $"#{unitId}", clearedAt), ct);
+
         return DispatchResult.Ok();
     }
 
@@ -173,6 +197,10 @@ public class DispatchService : IDispatchService
         incident.ClosedAtUtc = now;
 
         await _db.SaveChangesAsync(ct);
+
+        await _publisher.PublishAsync(new IncidentClosed(
+            incidentId, now, incident.TimeToFirstAssignmentSeconds), ct);
+
         return DispatchResult.Ok();
     }
 }

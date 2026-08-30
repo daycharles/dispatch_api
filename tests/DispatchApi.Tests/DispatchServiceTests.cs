@@ -12,9 +12,17 @@ public class DispatchServiceTests
 
     private static (DispatchService svc, FakeClock clock, Data.DispatchContext db) Build()
     {
+        var (svc, clock, db, _) = BuildWithPublisher();
+        return (svc, clock, db);
+    }
+
+    private static (DispatchService svc, FakeClock clock, Data.DispatchContext db, RecordingPublisher pub)
+        BuildWithPublisher()
+    {
         var db = TestDb.Create();
         var clock = new FakeClock(T0);
-        return (new DispatchService(db, clock), clock, db);
+        var publisher = new RecordingPublisher();
+        return (new DispatchService(db, clock, publisher), clock, db, publisher);
     }
 
     private static async Task<Unit> AddUnitAsync(Data.DispatchContext db, string callSign)

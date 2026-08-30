@@ -1,4 +1,5 @@
 using DispatchApi.Data;
+using DispatchApi.Messaging;
 using DispatchApi.Services;
 using Microsoft.EntityFrameworkCore;
 
@@ -28,4 +29,24 @@ public static class TestDb
 
         return new DispatchContext(options);
     }
+}
+
+/// <summary>
+/// Captures published events instead of talking to a broker, so the rules
+/// about *which* event is published and *when* are unit tested without any
+/// infrastructure. Anything that needs a real broker is an integration
+/// concern and is verified by running Compose.
+/// </summary>
+public sealed class RecordingPublisher : IIncidentPublisher
+{
+    public List<IIntegrationEvent> Published { get; } = new();
+
+    public Task PublishAsync(IIntegrationEvent @event, CancellationToken ct = default)
+    {
+        Published.Add(@event);
+        return Task.CompletedTask;
+    }
+
+    public IReadOnlyList<string> RoutingKeys =>
+        Published.Select(e => e.RoutingKey).ToList();
 }

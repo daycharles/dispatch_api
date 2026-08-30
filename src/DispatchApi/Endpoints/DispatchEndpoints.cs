@@ -79,5 +79,14 @@ public static class DispatchEndpoints
             return result.Success ? Results.NoContent() : Results.BadRequest(result.Error);
         })
             .WithSummary("Close an incident and clear all units");
+
+        incidents.MapGet("/{id:int}/notifications", async (int id, DispatchContext db, CancellationToken ct) =>
+            Results.Ok((await db.IncidentNotifications
+                    .AsNoTracking()
+                    .Where(n => n.IncidentId == id)
+                    .OrderBy(n => n.RaisedAtUtc)
+                    .ToListAsync(ct))
+                .Select(NotificationResponse.From)))
+            .WithSummary("Notifications raised asynchronously by the message consumer");
     }
 }
